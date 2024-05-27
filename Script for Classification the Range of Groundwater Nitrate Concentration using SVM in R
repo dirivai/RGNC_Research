@@ -1,4 +1,141 @@
-a
-a
-a
-a
+#libraries are needed
+library(terra)
+library(sf)
+library(readxl)
+library(rminer)
+
+# Call Parameter (The parameter already scale 0-1 using QGIS)
+DistoWB <- rast('DistWB48s_Norm.tif')
+Rainfall <- rast('Rainfall48s_Norm.tif')
+Elevation <- rast('Elev48s_Norm.tif')
+Litokuifer <- rast('Litokuifer48s_Norm.tif')
+NDVI <- rast('NDVI48s_Norm.tif')
+NDBI <- rast('NDBI48s_Norm.tif')
+NDTI <- rast('NDTI48s_Norm.tif')
+MNDWI <- rast('MNDWI48s_Norm.tif')
+Slope <- rast('Slope48s_Norm.tif')
+SPI <- rast('SPI48s_Norm.tif')
+Soil_Texture <- rast('Soiltext48s_Norm.tif')
+Populdens <- rast('Popdens48s_Norm.tif')
+
+# Script for stack parameter
+params <- brick(c(DistoWB, Rainfall, Elevation, Litokuifer, NDVI, NDBI, NDTI, MNDWI, Slope, SPI, Soil_Texture, Populdens))
+
+#The dataset already partision to 60% for data training and 40% for data validation.
+# Range of Groundwater are classes into 0-20 as label 1, 20-50 as label 2, 50-70 as label 3, 70-135 as label 4
+# Pemasukkan data sample
+data_train <- st_read("data_training.shp")
+data_valid <- st_read("data_validation.shp")
+
+#Preparation for extract raster parameter
+cls_data_train <- rasterize(data_train, params, field = as.integer(data_train$id))
+cls_data_valid <- rasterize(data_valid, params, field = as.integer(data_valid$id))
+
+data_train_masked <- mask(params, cls_data_train)
+data_valid_masked <- mask(params, cls_data_valid)
+
+train_set <- addLayer(data_train_masked, cls_data_train)
+valid_set <- addLayer(data_valid_masked, cls_data_valid)
+
+train_pixval <- getValues(train_set)
+valid_pixval <- getValues(valid_set)
+
+# Delete NA values if any
+train_pixval_ <- na.omit(train_pixval)
+valid_pixval_ <- na.omit(valid_pixval)
+
+# Conversion data value into dataframe
+train_pixval <- as.data.frame(train_pixval_)
+valid_pixval <- as.data.frame(valid_pixval_)
+
+# Conversuion 'layer' as label field dalam into factor
+train_pixval$layer <- factor(train_pixval$layer, levels = c(1:4))
+valid_pixval$layer <- factor(valid_pixval$layer, levels = c(1:4))
+
+#Create SVM model
+SVMclassifier <- fit(layer~., data=train_pixval, model="ksvm", C=0.1)
+svm.imp <- Importance(SVMclassifier, data=train_pixval)
+#svm.imp is a variable importance, it is manually saved as excel with file name "VarImp.xlsx"
+
+#Prediction
+pred.init <- predict(SVMclassifier, valid_pixval)
+
+#Confusion Matrix to see d'model evaluation
+svmtab.init <- table(valid_pixval$layer, pred.init)
+svmtab.init
+#svmtab.init is a confusion matrix of SVM groundwater nitrate range classificaton.
+#The confusion matrix manually saved as excel with file name "confusionMatrix.xlsx" and will use for visualization in the next step of variable importance
+
+acc.svminit <- sum(diag(svmtab.init)) / sum(svmtab.init)
+acc.svminit
+
+# Create Raster of Range of Groundwater Nitrate Concentration using SVM Model
+out_SVM <- raster::predict(params, SVMclassifier, filename="pred_svm.tif", overwrite=TRUE, progress="text")
+plot(out_SVM)
+
+# Visualization the Variable importance
+# Load necessary libraries
+library(readxl)
+library(ggplot2)
+
+# Read Excel file
+varimp <- read_excel("VarImp.xlsx")
+
+# Create a bar chart sorted from high to low
+varplot <- ggplot(varimp, aes(x = reorder(Parameter, -Variable_Importance), y = Variable_Importance)) + 
+  geom_col() + 
+  labs(x = "Parameter", y = "") + 
+  theme_classic()
+
+varplot <- ggplot(varimp, aes(x = reorder(Parameter, -Variable_Importance), y = Variable_Importance)) + 
+  geom_col() + 
+  labs(x = "", y = "Variable Importance") + 
+  theme(axis.text.y = element_blank(), axis.title.y = element_blank()) +
+  theme_classic()
+
+# Visualize the confusion matrix
+# Load necessary libraries
+library(readxl)
+library(caret)
+library(ggplot2)
+library(gridExtra)
+library(grid)
+library(scales)
+
+# Import data from Excel file
+data <- read_excel("confusionMatrix.xlsx")
+
+# Convert the actual and predicted columns to factors with the same levels
+data$actual <- as.factor(data$actual)
+data$predict <- as.factor(data$predict)
+
+# Create a confusion matrix
+conf_mat <- confusionMatrix(data$predict, data$actual)
+
+# Convert the confusion matrix table to a data frame
+conf_mat_df <- as.data.frame(conf_mat$table)
+
+# Calculate statistics
+cm_stats <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score"),
+  Value = c(round(conf_mat$overall[1]*100, 2), round(conf_mat$byClass[1]*100, 2), round(conf_mat$byClass[2]*100, 2), round(conf_mat$byClass[3]*100, 2))
+)
+
+# plotting the matrix
+cm_d_p <-  ggplot(data = conf_mat_df, aes(x = Prediction , y =  Reference, fill = Freq))+
+  geom_tile() +
+  geom_text(aes(label = round(Freq, 2)), color = 'green', size = 4) +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(labels = c("70-135", "50-70", "20-50", "0-20")) +
+  scale_y_discrete(labels = c("70-135", "50-70", "20-50", "0-20")) +
+  theme_light() +
+  theme(axis.text.x = element_text(face = "plain"),
+        axis.text.y = element_text(face = "plain")) +
+  guides(fill=FALSE) 
+
+# plotting the stats
+cm_st_p <- tableGrob(cm_stats, rows=NULL)
+
+# all together
+grid.arrange(cm_d_p, cm_st_p,nrow = 1, ncol = 2, 
+             top=textGrob("Confusion Matrix Prediction of SVM Groundwater Nitrate Range",gp=gpar(fontsize=8,font=1)))
